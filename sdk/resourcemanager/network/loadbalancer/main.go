@@ -6,21 +6,25 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
-	"log"
-	"os"
 )
 
 var (
-	subscriptionID      string
-	location            = "westus2"
-	resourceGroupName   = "sample-resources-group"
-	publicIPAddressName = "sample-public-ip"
-	loadBalancerName    = "sample-load-balancer"
+	subscriptionID          string
+	location                = "westus2"
+	resourceGroupName       = "sample-resources-group4"
+	publicIPAddressName     = "sample-public-ip"
+	loadBalancerName        = "sample-load-balancer-public"
+	privateLoadBalancerName = "sample-load-balancer-private"
+
+	subnet = "/subscriptions/d19dddf3-9520-4226-a313-ae8ee08675e5/resourceGroups/devbox-westus2/providers/Microsoft.Network/virtualNetworks/devbox-westus2-vnet/subnets/default"
 )
 
 func main() {
@@ -52,6 +56,12 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("load balancer:", *loadBalancer.ID)
+
+	privateLoadBalancer, err := createPrivateLoadBalancer(ctx, cred)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("load balancer:", *privateLoadBalancer.ID)
 
 	keepResource := os.Getenv("KEEP_RESOURCE")
 	if len(keepResource) == 0 {
@@ -93,6 +103,9 @@ func createPublicIP(ctx context.Context, cred azcore.TokenCredential) (*armnetwo
 		resourceGroupName,
 		publicIPAddressName,
 		armnetwork.PublicIPAddress{
+			SKU: &armnetwork.PublicIPAddressSKU{
+				Name: to.Ptr(armnetwork.PublicIPAddressSKUNameStandard),
+			},
 			Name:     to.Ptr(publicIPAddressName),
 			Location: to.Ptr(location),
 			Properties: &armnetwork.PublicIPAddressPropertiesFormat{
@@ -123,12 +136,20 @@ func createLoadBalancer(ctx context.Context, cred azcore.TokenCredential, pip *a
 	if err != nil {
 		return nil, err
 	}
+	sku := armnetwork.LoadBalancerSKU{
+		Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard),
+	}
+	log.Println(sku)
 
 	pollerResp, err := lbClient.BeginCreateOrUpdate(ctx,
 		resourceGroupName,
 		loadBalancerName,
+
 		armnetwork.LoadBalancer{
 			Location: to.Ptr(location),
+			SKU: &armnetwork.LoadBalancerSKU{
+				Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard),
+			},
 			Properties: &armnetwork.LoadBalancerPropertiesFormat{
 				FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
 					{
@@ -202,6 +223,121 @@ func createLoadBalancer(ctx context.Context, cred azcore.TokenCredential, pip *a
 							IdleTimeoutInMinutes: to.Ptr[int32](4),
 							FrontendIPConfiguration: &armnetwork.SubResource{
 								ID: to.Ptr(fmt.Sprintf("/%s/%s/frontendIPConfigurations/%s", idPrefix, loadBalancerName, frontEndIPConfigName)),
+							},
+						},
+					},
+				},
+			},
+		}, nil)
+
+	if err != nil {
+		return nil, fmt.Errorf("cannot create load balancer: %v", err)
+	}
+
+	resp, err := pollerResp.PollUntilDone(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.LoadBalancer, nil
+}
+
+func createPrivateLoadBalancer(ctx context.Context, cred azcore.TokenCredential) (*armnetwork.LoadBalancer, error) {
+	probeName := "probe"
+	frontEndIPConfigName := "fip"
+	backEndAddressPoolName := "backEndPool"
+	idPrefix := fmt.Sprintf("subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers", subscriptionID, resourceGroupName)
+
+	lbClient, err := armnetwork.NewLoadBalancersClient(subscriptionID, cred, nil)
+	if err != nil {
+		return nil, err
+	}
+	sku := armnetwork.LoadBalancerSKU{
+		Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard),
+	}
+	log.Println(sku)
+
+	pollerResp, err := lbClient.BeginCreateOrUpdate(ctx,
+		resourceGroupName,
+		privateLoadBalancerName,
+
+		armnetwork.LoadBalancer{
+			Location: to.Ptr(location),
+			SKU: &armnetwork.LoadBalancerSKU{
+				Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard),
+			},
+			Properties: &armnetwork.LoadBalancerPropertiesFormat{
+				FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+					{
+						Name: to.Ptr(frontEndIPConfigName),
+						Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+							Subnet: &armnetwork.Subnet{
+								ID: to.Ptr(subnet),
+							},
+						},
+					}},
+				BackendAddressPools: []*armnetwork.BackendAddressPool{
+					{
+						Name: &backEndAddressPoolName,
+					},
+				},
+				Probes: []*armnetwork.Probe{
+					{
+						Name: &probeName,
+						Properties: &armnetwork.ProbePropertiesFormat{
+							Protocol:          to.Ptr(armnetwork.ProbeProtocolHTTP),
+							Port:              to.Ptr[int32](80),
+							IntervalInSeconds: to.Ptr[int32](15),
+							NumberOfProbes:    to.Ptr[int32](4),
+							RequestPath:       to.Ptr("healthprobe.aspx"),
+						},
+					},
+				},
+				LoadBalancingRules: []*armnetwork.LoadBalancingRule{
+					{
+						Name: to.Ptr("lbRule"),
+						Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+							Protocol:             to.Ptr(armnetwork.TransportProtocolTCP),
+							FrontendPort:         to.Ptr[int32](80),
+							BackendPort:          to.Ptr[int32](80),
+							IdleTimeoutInMinutes: to.Ptr[int32](4),
+							EnableFloatingIP:     to.Ptr(false),
+							LoadDistribution:     to.Ptr(armnetwork.LoadDistributionDefault),
+							FrontendIPConfiguration: &armnetwork.SubResource{
+								ID: to.Ptr(fmt.Sprintf("/%s/%s/frontendIPConfigurations/%s", idPrefix, privateLoadBalancerName, frontEndIPConfigName)),
+							},
+							BackendAddressPool: &armnetwork.SubResource{
+								ID: to.Ptr(fmt.Sprintf("/%s/%s/backendAddressPools/%s", idPrefix, privateLoadBalancerName, backEndAddressPoolName)),
+							},
+							Probe: &armnetwork.SubResource{
+								ID: to.Ptr(fmt.Sprintf("/%s/%s/probes/%s", idPrefix, privateLoadBalancerName, probeName)),
+							},
+						},
+					},
+				},
+				InboundNatRules: []*armnetwork.InboundNatRule{
+					{
+						Name: to.Ptr("natRule1"),
+						Properties: &armnetwork.InboundNatRulePropertiesFormat{
+							Protocol:             to.Ptr(armnetwork.TransportProtocolTCP),
+							FrontendPort:         to.Ptr[int32](21),
+							BackendPort:          to.Ptr[int32](22),
+							EnableFloatingIP:     to.Ptr(false),
+							IdleTimeoutInMinutes: to.Ptr[int32](4),
+							FrontendIPConfiguration: &armnetwork.SubResource{
+								ID: to.Ptr(fmt.Sprintf("/%s/%s/frontendIPConfigurations/%s", idPrefix, privateLoadBalancerName, frontEndIPConfigName)),
+							},
+						},
+					},
+					{
+						Name: to.Ptr("natRule2"),
+						Properties: &armnetwork.InboundNatRulePropertiesFormat{
+							Protocol:             to.Ptr(armnetwork.TransportProtocolTCP),
+							FrontendPort:         to.Ptr[int32](23),
+							BackendPort:          to.Ptr[int32](22),
+							EnableFloatingIP:     to.Ptr(false),
+							IdleTimeoutInMinutes: to.Ptr[int32](4),
+							FrontendIPConfiguration: &armnetwork.SubResource{
+								ID: to.Ptr(fmt.Sprintf("/%s/%s/frontendIPConfigurations/%s", idPrefix, privateLoadBalancerName, frontEndIPConfigName)),
 							},
 						},
 					},
